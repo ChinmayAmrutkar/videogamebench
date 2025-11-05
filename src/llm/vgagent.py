@@ -17,6 +17,10 @@ from src.llm.llm_client import LLMClient
 from src.llm.prompts import SYSTEM_PROMPTS, TASK_PROMPTS, GBA_PROMPT, REFLECTION_PROMPT, GBA_REALTIME_PROMPT
 from src.llm.utils import parse_actions_response, convert_to_dict
 
+# >>> NEW: import embedding memory
+from src.memory.embedding_memory import EmbeddingMemory
+# <<<
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -70,7 +74,7 @@ class VideoGameBenchAgent:
         self.file_logger = self._setup_file_logger()
         self.file_logger.info(f"Initializing {self.__class__.__name__} with model: {model}")
 
-        # Initialize LLM client
+        # Initialize LLLM client
         self.llm_client = LLMClient(
             model=model,
             api_key=api_key,
@@ -294,6 +298,7 @@ class GameBoyVGAgent(VideoGameBenchAgent):
         self.context_window = context_window
 
         self.action = ""
+        our_prev_action_placeholder = ""  # to keep reader clarity
         self.prev_action = ""
 
         self.image_dir = self.log_dir / "game_screen"
@@ -302,6 +307,14 @@ class GameBoyVGAgent(VideoGameBenchAgent):
         if self.ui:
             self.monitor_dir = self.log_dir / "monitor"
             self.monitor_dir.mkdir(exist_ok=True)
+
+        # >>> NEW: initialize embedding memory
+        self.embedding_memory = EmbeddingMemory(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            max_items=5000,
+            use_faiss=False
+        )
+        # <<<
 
         logger.info(f"{self.__class__.__name__} initialized. Logging to: {self.log_dir}")
 
@@ -359,10 +372,77 @@ class GameBoyVGAgent(VideoGameBenchAgent):
                 }
             ]
         self.add_to_history("user", user_content, has_image=True)
-        
+
+        # >>> NEW: add a compact state snippet to embedding memory
+        state_text = self._compose_state_text()
+        self.embedding_memory.add([state_text], [{"step": self.step_count, "type": "state"}])
+        self.file_logger.info(f"[emb] add step={self.step_count} text='{state_text[:120]}'")
+
+        # <<<
+
+    # >>> NEW: helper to summarize state for embeddings
+    def _compose_state_text(self) -> str:
+        """
+        Build a short text summary of the current game state for embeddings.
+        Uses the latest user-visible texts and last action.
+        """
+        texts: List[str] = []
+        # scan recent messages (reverse order) and collect short text parts
+        for m in reversed(self.context_history):
+            c = m.content
+            if isinstance(c, list):
+                for item in c:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        t = item.get("text", "")
+                        if t:
+                            texts.append(t)
+            elif isinstance(c, str):
+                if c:
+                    texts.append(c)
+            if len(texts) >= 3:
+                break
+        last_obs = " | ".join(texts)[:200]
+        act = self.action or "None"
+        return f"game={self.game}; step={self.step_count}; last_action={act}; obs={last_obs}"
+    # <<<
+
     async def _prepare_messages(self) -> List[Dict[str, str]]:
         """Prepare the message list for LLM generation."""
-        messages = [{"role": m.role, "content": m.content} for m in self.context_history]
+        self.file_logger.info(f"[emb] _prepare_messages start step={self.step_count}")
+        messages = [{"role": m.role, "content": m.content} for m in self.context_history[-3:]]
+
+        # >>> NEW: embedding retrieval + loop guard
+        query = self._compose_state_text()
+
+        # Retrieve top similar past situations
+        hits = self.embedding_memory.search(query, k=3)
+        # log retrieval hit count
+        self.file_logger.info(f"[emb] step={self.step_count} hits={len(hits)} query='{query[:120]}'")
+
+        if hits:
+            retrieved = "\n".join([f"- {t}" for (t, _meta, _score) in hits])
+            self.file_logger.info(f"[emb] retrieved:\n{retrieved}")
+            messages.append({
+                "role": "user",
+                "content": (
+                    "[Relevant past situations]:\n"
+                    f"{retrieved}\n"
+                    "Use these to avoid repeating mistakes or getting stuck."
+                )
+            })
+
+        # Semantic loop/stall detection
+        if self.embedding_memory.loop_detect(query, recent=6, thresh=0.985):
+            self.file_logger.info(f"[emb] loop_detected step={self.step_count}")
+            messages.append({
+                "role": "system",
+                "content": (
+                    "You appear to be stuck in a repeating state.\n"
+                    "Do NOT repeat the same action. Try a different strategy or direction."
+                )
+            })
+        # <<<
+
         messages.append({
             "role": "user",
             "content": f"{REFLECTION_PROMPT}\n\n[Your current reflection memory]:\n{self.reflection_memory}"
@@ -410,6 +490,7 @@ class GameBoyVGAgent(VideoGameBenchAgent):
 
         # Update UI state
         self._update_ui_state("")
+        self.file_logger.info(f"[step] get_action start step={self.step_count}")
         
         # Prepare and send messages to LLM
         messages = await self._prepare_messages()
@@ -418,6 +499,7 @@ class GameBoyVGAgent(VideoGameBenchAgent):
             system_message=self.system_prompt,
             messages=messages
         )
+        self.file_logger.info(f"[step] get_action received LLM response at step={self.step_count}")
         response_time = time.time() - start_time
 
         # Handle error response
