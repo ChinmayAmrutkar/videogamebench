@@ -87,7 +87,10 @@ def parse_args():
                        help="Maximum tokens in conversation history (GBA only)")
     parser.add_argument("--action-frames", type=int, default=15,
                        help="Number of frames to run each action for (GBA only)")
-
+    
+    #Add checkpoints flag
+    parser.add_argument("--checkpoints", type=str, default=None,
+                    help="Path to a directory of PNG checkpoint screenshots to use for progress detection")
 
     return parser.parse_args()
 
@@ -107,28 +110,48 @@ def load_game_config(args):
     prompt_file = config_dir / "prompt.txt"
     # Try loading checkpoints if they exist
     checkpoint_dir = config_dir / "checkpoints"
-    if os.path.exists(checkpoint_dir):
-        try:
-            # Get all image files and sort numerically
-            checkpoint_files = sorted(
-                [f for f in checkpoint_dir.glob("*.png")],
-                key=lambda x: int(x.stem)  # Use stem to get filename without extension
-            )
-            print("Checkpoint files:", checkpoint_files)
-            if checkpoint_files:
-                checkpoint_hashes = []
-                for checkpoint in checkpoint_files:
-                    img = Image.open(checkpoint)
-                    hash_str = hash_image(img)
-                    checkpoint_hashes.append(hash_str)
-                args.checkpoints = checkpoint_hashes
-            else:
-                args.checkpoints = None
-        except:
-            args.checkpoints = None
-    else:
-        args.checkpoints = None
+    # if os.path.exists(checkpoint_dir):
+    #     try:
+    #         # Get all image files and sort numerically
+    #         checkpoint_files = sorted(
+    #             [f for f in checkpoint_dir.glob("*.png")],
+    #             key=lambda x: int(x.stem)  # Use stem to get filename without extension
+    #         )
+    #         print("Checkpoint files:", checkpoint_files)
+    #         if checkpoint_files:
+    #             checkpoint_hashes = []
+    #             for checkpoint in checkpoint_files:
+    #                 img = Image.open(checkpoint)
+    #                 hash_str = hash_image(img)
+    #                 checkpoint_hashes.append(hash_str)
+    #             args.checkpoints = checkpoint_hashes
+    #         else:
+    #             args.checkpoints = None
+    #     except:
+    #         args.checkpoints = None
+    # else:
+    #     args.checkpoints = None
     
+    # If --checkpoints points to a directory, load and hash all PNGs there
+    if args.checkpoints and os.path.isdir(args.checkpoints):
+        manual_dir = Path(args.checkpoints)
+        # sort using digits anywhere in the filename: screenshot_65.png, screesnhot_77.png, etc.
+        def num_key(p):
+            digits = "".join(ch for ch in p.stem if ch.isdigit())
+            return int(digits) if digits else 0
+        pngs = sorted(manual_dir.glob("*.png"), key=num_key)
+
+        if not pngs:
+            print(f"No PNGs found in {manual_dir}")
+        else:
+            checkpoint_hashes = []
+            for p in pngs:
+                img = Image.open(p)
+                checkpoint_hashes.append(hash_image(img))
+            args.checkpoints = checkpoint_hashes
+            print(f"Loaded {len(checkpoint_hashes)} manual checkpoints from {manual_dir}")
+
+
     print(f"Loading config from {config_file}")
     try:
         # Load YAML config
