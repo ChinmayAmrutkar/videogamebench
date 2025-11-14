@@ -1,0 +1,3 @@
+Tried to setup the videogamebench on the SOL super computer as it better provides resources like GPU, CPU and RAM for the proper execution of the 
+the games. However, the videogamebench requries UI as during execution the games pops up a new screen and SOL desktop 
+is bit slow to view and record the responses. So, for our implementation using local system.
