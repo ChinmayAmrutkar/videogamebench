@@ -25,10 +25,10 @@ try:
     )
 
     # Print the model's response
-    print("\n✅ Success! Gemini API responded:\n")
+    print("\nSuccess! Gemini API responded:\n")
     print(response.text)
 
 except Exception as e:
     # The new SDK raises different exceptions, but a general catch works for this test
-    print(f"\n❌ An error occurred: {e}")
+    print(f"\nAn error occurred: {e}")
     print("\nPlease check if your GEMINI_API_KEY is set correctly in the .env file.")
