@@ -16,6 +16,7 @@ from src.emulators.dos.browser_controller import BrowserController
 from src.llm.llm_client import LLMClient
 from src.llm.prompts import SYSTEM_PROMPTS, TASK_PROMPTS, GBA_PROMPT, REFLECTION_PROMPT, GBA_REALTIME_PROMPT
 from src.llm.utils import parse_actions_response, convert_to_dict
+from PIL import Image, ImageDraw
 
 # Configure logging
 logging.basicConfig(
@@ -96,7 +97,8 @@ class VideoGameBenchAgent:
         
         self.reflection_memory = ""
         self.step_count = 0
-        
+        self.current_target_coords = None  
+
         # Create consolidated log files
         self.reflection_log_file = self.log_dir / "reflections.txt"
         self.reflection_log_file.touch()
@@ -113,6 +115,61 @@ class VideoGameBenchAgent:
             from src.ui.vgagent_monitor import AgentMonitorUI
             self.ui = AgentMonitorUI(f"{model} agent playing {self.game} on VideoGameBench")
 
+    def _add_visual_grid(self, image: Image.Image, tile_size: int = 16) -> Image.Image:
+        """
+        Overlays a 16x16 grid AND coordinate labels on the screenshot.
+        This turns 'counting' into 'reading'.
+        """
+        from PIL import ImageFont  # Make sure to import this at the top
+        
+        draw = ImageDraw.Draw(image)
+        width, height = image.size
+        
+        # Try to load a default font, or fallback to default
+        try:
+            font = ImageFont.truetype("arial.ttf", 10)
+        except:
+            font = ImageFont.load_default()
+
+        # 1. Draw Grid Lines
+        for x in range(0, width, tile_size):
+            draw.line([(x, 0), (x, height)], fill="gray", width=1)
+            
+        for y in range(0, height, tile_size):
+            draw.line([(0, y), (width, y)], fill="gray", width=1)
+
+        # 2. Draw Coordinate Labels
+        col_idx = 0
+        for x in range(0, width, tile_size):
+            label = str(col_idx)
+            draw.text((x + 2, 2), label, fill="red", font=font)
+            col_idx += 1
+
+        row_idx = 0
+        for y in range(0, height, tile_size):
+            label = str(row_idx)
+            draw.text((2, y + 2), label, fill="red", font=font)
+            row_idx += 1
+
+        # 3. Draw Agent Marker (Yellow Box - Fixed Center)
+        center_x = (width // 2) // tile_size * tile_size
+        center_y = (height // 2) // tile_size * tile_size
+        draw.rectangle([center_x, center_y, center_x + tile_size, center_y + tile_size], outline="yellow", width=3)
+
+        # 4. Draw Target Marker (Green Box - Dynamic) <--- NEW SECTION
+        if self.current_target_coords:
+            target_col, target_row = self.current_target_coords
+            target_x = target_col * tile_size
+            target_y = target_row * tile_size
+            
+            if 0 <= target_x < width and 0 <= target_y < height:
+                draw.rectangle(
+                    [target_x, target_y, target_x + tile_size, target_y + tile_size], 
+                    outline="#00FF00",  # Bright Green
+                    width=3
+                )
+
+        return image
     
     def add_to_history(self, role: str, content: Any, has_image: bool = False, tokens: int = 0) -> None:
         """Add a message to both full history and context history."""
@@ -152,6 +209,19 @@ class VideoGameBenchAgent:
         
         self._prune_history()
 
+    def _parse_target_coords(self, response: str) -> None:
+        """Extracts target coordinates from response: Target: [col, row]"""
+        import re
+        # Look for pattern like "Target: [5, 2]" or "Target: [5,2]"
+        match = re.search(r'Target:\s*\[(\d+),\s*(\d+)\]', response)
+        if match:
+            try:
+                col = int(match.group(1))
+                row = int(match.group(2))
+                self.current_target_coords = (col, row)
+                self.file_logger.info(f"Updated Target Coords to: {self.current_target_coords}")
+            except:
+                pass
 
     def _prune_history(self) -> None:
         """Remove oldest messages if token count exceeds max_history_tokens."""
@@ -325,7 +395,16 @@ class GameBoyVGAgent(VideoGameBenchAgent):
                           prev_action: Optional[str] = None) -> None:
         """Store the observation in the history."""
         image = observation['screen']
+        
+        # --- NEW CONTEXT ENGINEERING: VISUAL GRID ---
+        # This modifies the image being sent to the LLM (and saved to logs)
+        # ensuring the agent can "see" the tiles.
+        image = self._add_visual_grid(image, tile_size=16) 
+        # ---------------------------------------------
+
         buttons = observation['buttons']
+        # image = observation['screen']
+        # buttons = observation['buttons']
         
         # Save image to log directory
         image_path = self._save_image(image)
@@ -427,6 +506,10 @@ class GameBoyVGAgent(VideoGameBenchAgent):
         # Log response time
         self.file_logger.info(f"Response time: {response_time:.2f}s")
         
+        # --- NEW: Parse Target Coordinates ---
+        self._parse_target_coords(response)  
+        # -------------------------------------
+
         # Process reflection and update history
         self._update_reflection_memory(response)
         self._add_response_to_history(response)
