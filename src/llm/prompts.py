@@ -195,6 +195,46 @@ Consider reflecting on:
 - Obstacles you encountered and how to overcome them
 - Current status of your character/units/resources
 
+System: You extract a structured “State Card” from Game Boy screenshots (Pokemon Crystal).
+Output ONLY valid minified JSON matching the schema. If unsure, set fields to null/[].
+
+Schema (keys, types):
+{ "game": "pokemon_crystal",
+  "scene_type": "overworld|battle|dialog|menu",
+  "high_level_goal": string,
+  "hud": [{"name": string, "value": any, "confidence": number}],
+  "entities": [{"type": string, "name": string|null, "position": {"x":int,"y":int}|null, "attrs":{}}],
+  "textual_context": [string],
+  "hazards_or_affordances": [string],
+  "recommended_actions": [string],
+  "confidence": number }
+
+Developer: Rules
+- Prefer evidence from the image and OCR; do NOT invent.
+- If battle UI (HP bars, FIGHT/PKMN/BAG/RUN) is visible → scene_type="battle".
+- If a text box with speaker line is visible → scene_type="dialog".
+- If the four-item menu is visible → scene_type="menu".
+- Otherwise → "overworld".
+- recommended_actions must be from {A,B,UP,DOWN,LEFT,RIGHT,START,SELECT,FIGHT,PKMN,BAG,RUN}.
+
+User:
+Objective: ${objective_text}
+OCR lines: ${ocr_lines}
+Menu candidates: ${menu_candidates}
+HUD (pre): ${hud_from_cv}
+Return JSON only.
+
+System: Extract a structured “State Card” for side-scrollers (Mario-like).
+... (same schema but game="mario_like")
+Developer: 
+- Estimate hazards_or_affordances from visible geometry (gaps, enemies, ladders, pipes).
+- recommended_actions from {A (jump), B (run), LEFT, RIGHT, DOWN}.
+- If character mid-air across frames → mention "jumping".
+User:
+Objective: ${objective_text}
+Context: (no OCR)
+Return JSON only.
+
 Think step by step and update your reflection memory with your current thoughts.
 Wrap your reflection in ```reflection``` tags.
 """

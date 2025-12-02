@@ -3,6 +3,36 @@ from src.consts import GBA_KEYS
 from typing import List, Tuple
 import re
 
+from dataclasses import dataclass, asdict
+from typing import List, Optional, Dict, Any
+
+@dataclass
+class HUDMetric:
+    name: str
+    value: Any
+    confidence: float
+
+@dataclass
+class Entity:
+    type: str            # 'player','npc','enemy','object','menu_item'
+    name: Optional[str]  # e.g., 'Pikachu','Zubat','Potion','Start Menu'
+    position: Optional[Dict[str,int]]  # {'x':..,'y':..} in screen coords
+    attrs: Dict[str,Any] # e.g., {'hp': 23, 'hp_max': 35, 'status': 'PAR'}
+
+@dataclass
+class StateCard:
+    game: str                   # 'mario','pokemon_crystal',...
+    scene_type: str             # 'overworld','battle','dialog','menu','combat','platforming'
+    high_level_goal: str        # injected from config/benchmark objective
+    hud: List[HUDMetric]        # time, score, money, badges, etc.
+    entities: List[Entity]      # player, opponent, enemies, menu items
+    textual_context: List[str]  # OCR’d lines / dialog box text
+    hazards_or_affordances: List[str]  # 'ledge ahead','tall grass','stairs','gap'
+    recommended_actions: List[str]     # ['FIGHT','TACKLE','BAG','RUN','A','DOWN','RIGHT']
+    confidence: float           # overall parse confidence 0..1
+
+    def asdict(self): return asdict(self)
+
 def convert_to_dict(
         actions: List[str | Tuple[str, ...]], 
         keys: str=GBA_KEYS):

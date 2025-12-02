@@ -1,236 +1,538 @@
-#!/usr/bin/env python3
-import argparse
-import yaml
+"""Evaluator for running LLM game interactions on VideoGameBench."""
+from __future__ import annotations
+
+from typing import Dict, Any, Optional, List, Callable, Tuple
 import asyncio
-import os
-import sys
-import webbrowser
-import signal
+import io
 import time
-from typing import Optional, Dict, Any
+import inspect
+from abc import ABC, abstractmethod
+
+import numpy as np
 from PIL import Image
-from pathlib import Path
-from src.llm.prompts import DOS_PROMPT
-from src.utils import hash_image
 
-# Add project root to path
-project_root = Path(__file__).parent
-sys.path.append(str(project_root))
-
-# Try to load environment variables from .env file
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    print("python-dotenv not installed. Environment variables must be set manually.")
-
-# Global variables for clean shutdown
-game_instance = None
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="Game Emulation and Evaluation with LLMs")
-    
-    # VideoGameBench emulator attributes
-    parser.add_argument("--emulator", choices=["dos", "gba"],
-                       help="Which emulator to use ('dos' or 'gba'). Overwritten if config is specified.")
-    parser.add_argument("--game", type=str, 
-                       help="Name or URL of a js-dos game bundle to run or GBA game to load")
-    parser.add_argument("--lite", action="store_true", 
-                       help="Lite-mode, so not real time. Game pauses between actions.")
-    parser.add_argument("--max-steps", type=int, default=15000, 
-                       help="Maximum number of steps to run")
-
-    # Common arguments
-    parser.add_argument("--enable-ui", action="store_true", 
-                       help="Enable the UI for the agent")
-    parser.add_argument("--threshold", type=float,  
-                       help="Threshold for checkpoint progress")
-    parser.add_argument("--model", type=str, default="gpt-4o",
-                       help="The LLM model to use (for LiteLLM names). Default is gpt-4o")
-    parser.add_argument("--headless", action="store_true", 
-                       help="Run the emulator without visual display")
-    parser.add_argument("--config-folder", type=str, default="configs/",
-                       help="Path to the config folder")
-    parser.add_argument("--max-tokens", type=int, default=1024, 
-                       help="The maximum number of tokens to generate")
-    parser.add_argument("--temperature", type=float, default=0.7, 
-                       help="The temperature for LLM generation")
-    parser.add_argument("--num-screenshots-per-action", type=int, default=0, 
-                       help="Number of screenshots to take per action to add in context. 0 has default behavior described in the paper.")
-    parser.add_argument("--max-context-size", type=int, default=20, 
-                       help="Maximum number of messages in the context window. Default is 20.")
-
-    # LiteLLM + Ollama args
-    parser.add_argument("--api-key", type=str, 
-                       help="API key for the chosen LLM provider")
-    parser.add_argument("--api-base", type=str, default=None,
-                       help="API base URL for Ollama or other providers")
-
-    # DOS-specific arguments
-    parser.add_argument("--port", type=int, default=8000, 
-                       help="Port to run the server on (DOS only)")
-    parser.add_argument("--task", type=str, default="",
-                       help="The task for the agent to execute (DOS only)")
-    parser.add_argument("--url", type=str, default="", 
-                       help="The URL to start from (DOS only)")
-    parser.add_argument("--website-only", action="store_true", 
-                       help="Just open the website without agent interaction (DOS only)")
-    
-    # GBA-specific arguments
-    parser.add_argument("--step-delay", type=float, default=0.0, 
-                       help="Delay between steps in seconds (GBA only)")
-    parser.add_argument("--skip-frames", type=int, default=1, 
-                       help="Number of frames to skip per step (GBA only)")
-    parser.add_argument("--fake-actions", action="store_true", 
-                       help="Use random actions instead of calling the LLM (GBA only)")
-    parser.add_argument("--history-tokens", type=int, default=4000, 
-                       help="Maximum tokens in conversation history (GBA only)")
-    parser.add_argument("--action-frames", type=int, default=15,
-                       help="Number of frames to run each action for (GBA only)")
-    
-    #Add checkpoints flag
-    parser.add_argument("--checkpoints", type=str, default=None,
-                    help="Path to a directory of PNG checkpoint screenshots to use for progress detection")
-
-    return parser.parse_args()
-
-def load_game_config(args):
-    """Load game configuration and prompt from the appropriate config folder."""
-    # DOS-specific game defaults
-    args.press_key_delay = 100
-
-    if not args.game or not args.config_folder:
-        print(f"No game or config folder specified. Exiting.")
-        return args
-
-    # Determine config path based on emulator type
-    config_base = Path(args.config_folder)
-    config_dir = config_base / args.game
-    config_file = config_dir / "config.yaml"
-    prompt_file = config_dir / "prompt.txt"
-    # Try loading checkpoints if they exist
-    checkpoint_dir = config_dir / "checkpoints"
-    # if os.path.exists(checkpoint_dir):
-    #     try:
-    #         # Get all image files and sort numerically
-    #         checkpoint_files = sorted(
-    #             [f for f in checkpoint_dir.glob("*.png")],
-    #             key=lambda x: int(x.stem)  # Use stem to get filename without extension
-    #         )
-    #         print("Checkpoint files:", checkpoint_files)
-    #         if checkpoint_files:
-    #             checkpoint_hashes = []
-    #             for checkpoint in checkpoint_files:
-    #                 img = Image.open(checkpoint)
-    #                 hash_str = hash_image(img)
-    #                 checkpoint_hashes.append(hash_str)
-    #             args.checkpoints = checkpoint_hashes
-    #         else:
-    #             args.checkpoints = None
-    #     except:
-    #         args.checkpoints = None
-    # else:
-    #     args.checkpoints = None
-    
-    # If --checkpoints points to a directory, load and hash all PNGs there
-    if args.checkpoints and os.path.isdir(args.checkpoints):
-        manual_dir = Path(args.checkpoints)
-        # sort using digits anywhere in the filename: screenshot_65.png, screesnhot_77.png, etc.
-        def num_key(p):
-            digits = "".join(ch for ch in p.stem if ch.isdigit())
-            return int(digits) if digits else 0
-        pngs = sorted(manual_dir.glob("*.png"), key=num_key)
-
-        if not pngs:
-            print(f"No PNGs found in {manual_dir}")
-        else:
-            checkpoint_hashes = []
-            for p in pngs:
-                img = Image.open(p)
-                checkpoint_hashes.append(hash_image(img))
-            args.checkpoints = checkpoint_hashes
-            print(f"Loaded {len(checkpoint_hashes)} manual checkpoints from {manual_dir}")
+# Project imports
+from src.llm.vgagent import GameBoyVGAgent, WebBrowsingVGAgent
+from src.emulators.gba.interface import GBAInterface
+from src.emulators.dos.website_server import DOSGameServer
+from src.emulators.dos.interface import DOSGameInterface
+from src.utils import is_same_hash, hash_image, dist_hash
 
 
-    print(f"Loading config from {config_file}")
+# --------------------------- helpers ---------------------------
+
+def _to_bool_array(h) -> Optional[np.ndarray]:
+    """
+    Coerce ImageHash or ndarray into a boolean ndarray.
+    Returns None if coercion fails.
+    """
     try:
-        # Load YAML config
-        with open(config_file, 'r') as f:
-            config = yaml.safe_load(f)
-            
-        # Load prompt if it exists
-        if prompt_file.exists():
-            with open(prompt_file, 'r', encoding='utf-8') as f:
-                config['task_prompt'] = f.read().strip()
+        if hasattr(h, "hash"):  # imagehash.ImageHash
+            arr = h.hash
+            return arr.astype(bool) if hasattr(arr, "astype") else np.array(arr, dtype=bool)
+        if isinstance(h, np.ndarray):
+            return h.astype(bool)
+        if isinstance(h, (list, tuple)):
+            arr = np.array(h)
+            return arr.astype(bool)
+    except Exception:
+        pass
+    return None
+
+
+def _bit_diff(a: np.ndarray, b: np.ndarray) -> int:
+    a = a.astype(bool).ravel()
+    b = b.astype(bool).ravel()
+    if a.size != b.size:
+        n = min(a.size, b.size)
+        a = a[:n]
+        b = b[:n]
+    return int(np.count_nonzero(a ^ b))
+
+
+def _safe_is_same_hash(a_bool: np.ndarray, b_bool: np.ndarray, threshold_bits: float) -> bool:
+    try:
+        return bool(is_same_hash(a_bool, b_bool, threshold=threshold_bits, verbose=False))  # type: ignore
+    except Exception:
+        pass
+    return _bit_diff(a_bool, b_bool) <= int(threshold_bits)
+
+
+def _safe_dist_hash(a_bool: np.ndarray, b_bool: np.ndarray) -> float:
+    try:
+        return float(dist_hash(a_bool, b_bool))  # type: ignore
+    except Exception:
+        bits = max(1, a_bool.size, b_bool.size)
+        return _bit_diff(a_bool, b_bool) / float(bits)
+
+
+def _dos_session_started(agent, t0: float, seen_frames: int, min_seconds: float = 5.0) -> bool:
+    """
+    Consider DOS session 'started' only after:
+      (a) at least one non-empty frame has been captured,
+      (b) at least one keypress has occurred,
+      (c) at least `min_seconds` have elapsed since t0.
+    Compatible with WebBrowsingVGAgent; if the agent exposes
+    has_seen_first_frame()/keypress_count(), we use those too.
+    """
+    try:
+        if hasattr(agent, "has_seen_first_frame"):
+            seen = bool(agent.has_seen_first_frame())
         else:
-            print(f"Warning: No prompt file found at {prompt_file}")
-            config['task_prompt'] = ""
-            
-        # Update args with config values, preserving command-line overrides
-        for key, value in config.items():
-            # Only update if not explicitly set in command line
-            if not getattr(args, key, None):
-                setattr(args, key, value)
-                
-        # Special handling for DOS games
-        if args.emulator == "dos":
-            html_file = config_dir / "game.html"
-            if html_file.exists():
-                with open(html_file, 'r') as f:
-                    args.custom_html = f.read()
+            seen = seen_frames > 0
+
+        if hasattr(agent, "keypress_count"):
+            keys = int(agent.keypress_count())
+        else:
+            keys = int(getattr(agent, "_keypress_count", 0))
+
+        elapsed = time.time() - float(t0 or 0.0)
+        return bool(seen and keys >= 1 and elapsed >= float(min_seconds))
+    except Exception:
+        return False
+
+
+# --------------------------- base evaluator ---------------------------
+
+class BaseVGBenchEvaluator(ABC):
+    """Abstract base class for evaluators that coordinate between game emulators and LLMs."""
+
+    def __init__(
+        self,
+        max_steps: int = 1000,
+        step_delay: float = 0.0,
+        metrics: Optional[List[Callable]] = None,
+        checkpoints: Optional[List[Any]] = None,
+        threshold: Optional[float] = None,
+    ):
+        self.max_steps = max_steps
+        self.step_delay = step_delay
+        self.metrics = metrics or []
+
+        raw_ckpts = checkpoints or []
+        self.checkpoints: List[np.ndarray] = []
+        for c in raw_ckpts:
+            arr = _to_bool_array(c)
+            if arr is not None:
+                self.checkpoints.append(arr)
+
+        self.threshold: float = float(threshold if threshold is not None else 10.0)
+        self.current_checkpoint_idx: Optional[int] = 0 if self.checkpoints else None
+        self.completed_checkpoints: set[int] = set()
+        self._prev_dist_to_next: Optional[float] = None
+
+        try:
+            self._hash_bits = int(self.checkpoints[0].size) if self.checkpoints else 64
+        except Exception:
+            self._hash_bits = 64
+
+    @abstractmethod
+    async def run_episode(self, agent) -> Dict[str, Any]:
+        raise NotImplementedError
+
+    # ---------- hashing & reward utilities ----------
+
+    def _obs_to_hash_bool(self, obs_img_or_dict: Any) -> Optional[np.ndarray]:
+        try:
+            img = obs_img_or_dict
+            if isinstance(obs_img_or_dict, dict) and "screen" in obs_img_or_dict:
+                img = obs_img_or_dict["screen"]
+
+            if isinstance(img, np.ndarray) and img.dtype == bool:
+                return img
+
+            if isinstance(img, np.ndarray) and img.ndim in (2, 3):
+                pil = Image.fromarray(img)
+                h = hash_image(pil)
+            elif isinstance(img, Image.Image):
+                h = hash_image(img)
             else:
-                args.custom_html = None
-                
-    except FileNotFoundError:
-        print(f"No config file found at {config_file}")
-        print(f"Using default configuration for {args.game}")
-    except Exception as e:
-        print(f"Error loading config: {e}")
-        
-    return args
+                h = hash_image(img)
 
-def handle_shutdown_signal(sig, frame):
-    """Handle shutdown signals for clean exit."""
-    print("\nShutdown signal received. Cleaning up...")
-        
-    # Close any active screen recorder
-    if hasattr(game_instance, 'monitor') and game_instance.monitor:
-        if game_instance.monitor.screen_recorder:
-            game_instance.monitor.screen_recorder.close()
-    
-    sys.exit(0)
+            return _to_bool_array(h)
+        except Exception:
+            return None
 
-async def videogamebench_start():
-    """Main async entry point."""
-    args = parse_args()
-    args = load_game_config(args)
+    def _dense_shaping_reward(self, obs_bool: np.ndarray) -> float:
+        if self.current_checkpoint_idx is None:
+            return 0.0
+        if self.current_checkpoint_idx >= len(self.checkpoints):
+            return 0.0
 
-    if args.model == "gpt-4o":
-        args.model = "gpt-4o"
-    elif args.model == "claude-3.7":
-        args.model = "claude-3-7-sonnet-20250219"
-    elif args.model == "gemini-2.0-flash":
-        args.model = "gemini/gemini-2.0-flash"
-    elif args.model == "llama4":
-        args.model = "together_ai/meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8"
+        target = self.checkpoints[self.current_checkpoint_idx]
+        d = _safe_dist_hash(obs_bool, target)
 
-    if args.emulator == "dos":
-        from src.run_vgbench_dos import run_dos_emulator
-        await run_dos_emulator(args)
-    elif args.emulator == "gba":
-        from src.run_vgbench_gb import run_gba_emulator
-        await run_gba_emulator(args)
-    else:
-        print("No emulator specified. Exiting.")
-        sys.exit(1)
+        rew = 0.0
+        if self._prev_dist_to_next is not None:
+            improvement = self._prev_dist_to_next - d
+            if improvement > 0:
+                rew = float(improvement)
+        self._prev_dist_to_next = d
+        return rew
 
-if __name__ == "__main__":
-    # Register signal handlers for clean shutdown
-    signal.signal(signal.SIGINT, handle_shutdown_signal)
-    signal.signal(signal.SIGTERM, handle_shutdown_signal)
-    
-    # Run the main function
-    try:
-        asyncio.run(videogamebench_start())
-    except KeyboardInterrupt:
-        print("\nProgram interrupted. Cleaning up...")
+    def _on_advance_checkpoint(self) -> None:
+        self._prev_dist_to_next = None
+
+    def _check_checkpoint_progress(self, obs_img_or_dict: Any, agent: Any) -> Tuple[bool, float]:
+        obs_bool = self._obs_to_hash_bool(obs_img_or_dict)
+        if obs_bool is None:
+            return False, 0.0
+
+        shaped = self._dense_shaping_reward(obs_bool)
+
+        hit = False
+        if self.checkpoints and self.current_checkpoint_idx is not None:
+            for idx in range(self.current_checkpoint_idx, len(self.checkpoints)):
+                ck = self.checkpoints[idx]
+                try:
+                    same = _safe_is_same_hash(obs_bool, ck, threshold_bits=self.threshold)
+                except Exception:
+                    same = False
+
+                if same:
+                    hit = True
+                    self.completed_checkpoints.add(idx)
+                    self.current_checkpoint_idx = idx + 1
+                    self._on_advance_checkpoint()
+                    try:
+                        agent.update_checkpoint(idx + 1)
+                    except Exception:
+                        pass
+                    shaped += 1.0
+                    break
+
+        return hit, shaped
+
+
+# --------------------------- GB evaluator ---------------------------
+
+class GBEvaluator(BaseVGBenchEvaluator):
+    """Evaluator that coordinates Game Boy emulators and LLMs."""
+
+    def __init__(
+        self,
+        game_interface: GBAInterface,
+        max_steps: int = 1000,
+        step_delay: float = 0.1,
+        skip_frames: int = 1,
+        metrics: Optional[List[Callable]] = None,
+        fake_actions: bool = False,
+        action_frames: int = 30,
+        checkpoints: Optional[List[Any]] = None,
+        threshold: float = 10.0,
+    ):
+        super().__init__(max_steps, step_delay, metrics, checkpoints, threshold)
+        self.game = game_interface
+        self.fake_actions = fake_actions
+        self.skip_frames = skip_frames
+        self.action_frames = action_frames
+
+    async def run_episode(self, agent: GameBoyVGAgent, lite: bool = False) -> Dict[str, Any]:
+        return await (self.run_episode_lite(agent) if lite else self.run_episode_realtime(agent))
+
+    async def run_episode_lite(self, gba_agent: GameBoyVGAgent) -> Dict[str, Any]:
+        try:
+            if self.checkpoints:
+                gba_agent.setup_checkpoints(len(self.checkpoints))
+        except Exception:
+            pass
+
+        try:
+            obs = self.game.get_observation()
+            gba_agent.store_observation(obs)
+
+            actions_to_run: List[Optional[Dict[str, bool]]] = []
+
+            for _ in range(self.max_steps):
+                if not actions_to_run:
+                    actions_to_run = await gba_agent.get_action()
+
+                action = actions_to_run.pop(0) if actions_to_run else None
+
+                if action is None:
+                    obs, _, _, _ = self.game.no_op(self.action_frames)
+                else:
+                    obs, _, _, _ = self.game.step(action, self.action_frames)
+
+                gba_agent.store_observation(obs)
+
+                hit, shaped = self._check_checkpoint_progress(
+                    obs["screen"] if isinstance(obs, dict) and "screen" in obs else obs,
+                    gba_agent,
+                )
+
+                total = len(self.checkpoints)
+                current = int(self.current_checkpoint_idx or 0)
+                progress = (current / total) if total > 0 else 0.0
+
+                try:
+                    await gba_agent.post_action(action, float(shaped), {"progress": float(progress)})
+                except TypeError:
+                    try:
+                        gba_agent.post_action(action, float(shaped), {"progress": float(progress)})
+                    except Exception:
+                        pass
+
+                if hit and (self.current_checkpoint_idx is not None) and (self.current_checkpoint_idx >= len(self.checkpoints)):
+                    print("Task complete! All checkpoints completed.")
+                    break
+
+        except KeyboardInterrupt:
+            print("\nEvaluation interrupted by user")
+        except Exception as e:
+            print(f"Error during evaluation: {e}")
+        finally:
+            try:
+                self.game.close()
+            except Exception:
+                pass
+
+        return {}
+
+    async def run_episode_realtime(self, gba_agent: GameBoyVGAgent) -> Dict[str, Any]:
+        try:
+            if self.checkpoints:
+                gba_agent.setup_checkpoints(len(self.checkpoints))
+        except Exception:
+            pass
+
+        try:
+            obs = self.game.get_observation()
+            gba_agent.store_observation(obs)
+
+            actions_to_run: List[Optional[Dict[str, bool]]] = []
+
+            for _ in range(self.max_steps):
+                if not actions_to_run:
+                    action_task = asyncio.create_task(gba_agent.get_action())
+
+                    while not action_task.done():
+                        obs, _, _, _ = self.game.no_op(1)
+                        gba_agent.store_observation(obs)
+
+                        hit, shaped = self._check_checkpoint_progress(
+                            obs["screen"] if isinstance(obs, dict) and "screen" in obs else obs,
+                            gba_agent,
+                        )
+
+                        total = len(self.checkpoints)
+                        current = int(self.current_checkpoint_idx or 0)
+                        progress = (current / total) if total > 0 else 0.0
+
+                        try:
+                            await gba_agent.post_action(None, float(shaped), {"progress": float(progress)})
+                        except TypeError:
+                            try:
+                                gba_agent.post_action(None, float(shaped), {"progress": float(progress)})
+                            except Exception:
+                                pass
+
+                        if hit and (self.current_checkpoint_idx is not None) and (self.current_checkpoint_idx >= len(self.checkpoints)):
+                            print("Task complete! All checkpoints completed.")
+                            break
+
+                        await asyncio.sleep(0.01)
+
+                    if action_task.done():
+                        actions_to_run = await action_task
+
+                if not actions_to_run:
+                    obs, _, _, _ = self.game.no_op(self.action_frames)
+                    gba_agent.store_observation(obs)
+
+                    hit, shaped = self._check_checkpoint_progress(
+                        obs["screen"] if isinstance(obs, dict) and "screen" in obs else obs,
+                        gba_agent,
+                    )
+
+                    total = len(self.checkpoints)
+                    current = int(self.current_checkpoint_idx or 0)
+                    progress = (current / total) if total > 0 else 0.0
+
+                    try:
+                        await gba_agent.post_action(None, float(shaped), {"progress": float(progress)})
+                    except TypeError:
+                        try:
+                            gba_agent.post_action(None, float(shaped), {"progress": float(progress)})
+                        except Exception:
+                            pass
+
+                    if hit and (self.current_checkpoint_idx is not None) and (self.current_checkpoint_idx >= len(self.checkpoints)):
+                        print("Task complete! All checkpoints completed.")
+                    continue
+
+                current_action = actions_to_run.pop(0)
+                if current_action is not None:
+                    obs, _, _, _ = self.game.step(current_action, self.action_frames)
+                else:
+                    obs, _, _, _ = self.game.no_op(self.action_frames)
+
+                gba_agent.store_observation(obs)
+
+                hit, shaped = self._check_checkpoint_progress(
+                    obs["screen"] if isinstance(obs, dict) and "screen" in obs else obs,
+                    gba_agent,
+                )
+
+                total = len(self.checkpoints)
+                current = int(self.current_checkpoint_idx or 0)
+                progress = (current / total) if total > 0 else 0.0
+
+                try:
+                    await gba_agent.post_action(current_action, float(shaped), {"progress": float(progress)})
+                except TypeError:
+                    try:
+                        gba_agent.post_action(current_action, float(shaped), {"progress": float(progress)})
+                    except Exception:
+                        pass
+
+                if hit and (self.current_checkpoint_idx is not None) and (self.current_checkpoint_idx >= len(self.checkpoints)):
+                    print("Task complete! All checkpoints completed.")
+                    break
+
+        except KeyboardInterrupt:
+            print("\nEvaluation interrupted by user")
+        except Exception as e:
+            print(f"Error during realtime evaluation: {e}")
+
+        return {}
+
+
+# --------------------------- DOS evaluator ---------------------------
+
+class DOSEvaluator(BaseVGBenchEvaluator):
+    """Evaluator coordinating JS-DOS style web games and LLMs."""
+
+    def __init__(
+        self,
+        max_steps: int = 10000,
+        step_delay: float = 0.1,
+        metrics: Optional[List[Callable]] = None,
+        checkpoints: Optional[List[Any]] = None,
+        game_interface: DOSGameInterface = None,
+        threshold: float = 10.0,
+        min_start_seconds: float = 5.0,
+    ):
+        super().__init__(max_steps, step_delay, metrics, checkpoints, threshold)
+        self.game = game_interface
+        self.min_start_seconds = float(min_start_seconds)
+
+    async def start(self, url: str):
+        await self.game.load_game(initial_url=url)
+
+    async def run_episode(
+        self,
+        dos_agent: WebBrowsingVGAgent,
+        task: str,
+        server: DOSGameServer
+    ) -> Dict[str, Any]:
+
+        if self.checkpoints:
+            try:
+                dos_agent.setup_checkpoints(len(self.checkpoints))
+            except Exception:
+                pass
+
+        start_time = time.time()
+        seen_frames = 0
+        session_started = False
+        task_complete = False
+
+        try:
+            # initial screen
+            screen = await self.game.get_observation()
+            # async-safe: await only if the call is awaitable
+            res = dos_agent.store_observation([screen])
+            if inspect.isawaitable(res):
+                await res
+
+            for step in range(self.max_steps):
+                action, action_input = await dos_agent.get_action(task, self.game.browser, step)
+                # pre_action may be async or sync depending on base class
+                try:
+                    if inspect.iscoroutinefunction(dos_agent.pre_action):
+                        await dos_agent.pre_action(action, action_input, self.game.lite)
+                    else:
+                        dos_agent.pre_action(action, action_input, self.game.lite)
+                except Exception:
+                    pass
+
+                info, frames = await self.game.step(action, action_input)
+
+                try:
+                    if inspect.iscoroutinefunction(dos_agent.post_action):
+                        await dos_agent.post_action(info, frames, action, action_input)
+                    else:
+                        dos_agent.post_action(info, frames, action, action_input)
+                except Exception:
+                    pass
+
+                if frames:
+                    seen_frames += len(frames)
+
+                if not session_started:
+                    session_started = _dos_session_started(
+                        dos_agent, start_time, seen_frames, self.min_start_seconds
+                    )
+
+                total_ck = len(self.checkpoints)
+                current = int(self.current_checkpoint_idx or 0)
+                progress = (current / total_ck) if total_ck > 0 else 0.0
+
+                # allow DOS agent to log shaped rewards too
+                if hasattr(dos_agent, "post_action_reward"):
+                    try:
+                        if inspect.iscoroutinefunction(dos_agent.post_action_reward):
+                            await dos_agent.post_action_reward(0.0, {"progress": float(progress)})
+                        else:
+                            dos_agent.post_action_reward(0.0, {"progress": float(progress)})
+                    except Exception:
+                        pass
+
+                if session_started:
+                    for frame in frames:
+                        try:
+                            pil = Image.open(io.BytesIO(frame)).crop((50, 0, 640, 400))
+                        except Exception:
+                            continue
+
+                        hit, shaped = self._check_checkpoint_progress(pil, dos_agent)
+
+                        if shaped != 0.0 and hasattr(dos_agent, "post_action_reward"):
+                            try:
+                                if inspect.iscoroutinefunction(dos_agent.post_action_reward):
+                                    await dos_agent.post_action_reward(float(shaped), {"progress": float(progress)})
+                                else:
+                                    dos_agent.post_action_reward(float(shaped), {"progress": float(progress)})
+                            except Exception:
+                                pass
+
+                        if hit and (self.current_checkpoint_idx is not None) and (self.current_checkpoint_idx >= len(self.checkpoints)):
+                            task_complete = True
+                            break
+
+                if task_complete:
+                    print("Task complete! All checkpoints completed.")
+                    break
+
+            if not task_complete and self.max_steps > 0:
+                if not session_started:
+                    print("Not started: waiting for first frame + keypress + elapsed time; task not evaluated.")
+                else:
+                    print("Reached maximum number of steps without completing the task.")
+        finally:
+            try:
+                await self.game.close()
+            except Exception:
+                pass
+            try:
+                await dos_agent.stop()
+            except Exception:
+                pass
+            try:
+                if server:
+                    server.stop()
+            except Exception:
+                pass
+
+        return {}

@@ -1,11 +1,15 @@
 import os
 import sys
 from pathlib import Path
+from src.llm.memento_agent import MementoGameBoyVGAgent as GameBoyVGAgent
+from src.llm.memento_agent import MementoGameBoyVGAgent as GameBoyVGAgent
+
 
 def import_gba_modules():
     try:
         from src.emulators.gba.interface import GBAInterface
-        from src.llm.vgagent import GameBoyVGAgent
+        # from src.llm.vgagent import GameBoyVGAgent
+        from src.llm.memento_agent import MementoGameBoyVGAgent as GameBoyVGAgent
         from src.vgbench_evaluator import GBEvaluator
         from src.consts import ROM_FILE_MAP
         return GBAInterface, GameBoyVGAgent, GBEvaluator, ROM_FILE_MAP
@@ -56,6 +60,18 @@ async def run_gba_emulator(args):
         # Don't initialize any API if using fake actions
         print("Using fake random actions (no LLM API calls)")
 
+    memento_cfg = {
+        "top_k": 3,                 # how many past cases to inject
+        "write_every_n_steps": 1,   # log to memory every step
+        "recency_decay": 0.997,
+        "reward_coef": 0.5,
+        "progress_coef": 0.5,
+        "capacity": 2048,           # keep up to 2k cases in RAM
+        "persist": True,            # write memento_memory.jsonl
+        "debug_retrieval": True,    # also save retrieval prompt/cases for each step
+        "use_ocr": True,  
+    }
+    
     # Initialize the realtime GBAAgent
     gba_agent = GameBoyVGAgent(
         model=model,
@@ -69,6 +85,7 @@ async def run_gba_emulator(args):
         enable_ui=args.enable_ui,
         task_prompt=args.task_prompt,
         api_base=args.api_base,
+        memento=memento_cfg, 
     )
     print(f"Using VGagent on VideoGameBench with model: {model}")
     
