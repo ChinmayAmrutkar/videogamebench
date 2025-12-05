@@ -16,7 +16,9 @@ from src.emulators.dos.browser_controller import BrowserController
 from src.llm.llm_client import LLMClient
 from src.llm.prompts import SYSTEM_PROMPTS, TASK_PROMPTS, GBA_PROMPT, REFLECTION_PROMPT, GBA_REALTIME_PROMPT
 from src.llm.utils import parse_actions_response, convert_to_dict
-
+from PIL import Image, ImageDraw
+# >>> NEW: import embedding memory
+from src.memory.embedding_memory import EmbeddingMemory
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -113,6 +115,55 @@ class VideoGameBenchAgent:
             from src.ui.vgagent_monitor import AgentMonitorUI
             self.ui = AgentMonitorUI(f"{model} agent playing {self.game} on VideoGameBench")
 
+    # def _add_visual_grid(self, image: Image.Image, tile_size: int = 16) -> Image.Image:
+    #     """
+    #     Overlays a 16x16 grid AND coordinate labels on the screenshot.
+    #     This turns 'counting' into 'reading'.
+    #     """
+    #     from PIL import ImageFont  # Make sure to import this at the top
+        
+    #     draw = ImageDraw.Draw(image)
+    #     width, height = image.size
+        
+    #     # Try to load a default font, or fallback to default
+    #     try:
+    #         font = ImageFont.truetype("arial.ttf", 10)
+    #     except:
+    #         font = ImageFont.load_default()
+
+    #     # 1. Draw Grid Lines
+    #     for x in range(0, width, tile_size):
+    #         draw.line([(x, 0), (x, height)], fill="gray", width=1)
+            
+    #     for y in range(0, height, tile_size):
+    #         draw.line([(0, y), (width, y)], fill="gray", width=1)
+
+    #     # 2. Draw Coordinate Labels (The "Battleship" Fix)
+    #     # Draw Column Numbers (X) at the top
+    #     col_idx = 0
+    #     for x in range(0, width, tile_size):
+    #         # Draw text with a black outline for readability
+    #         label = str(col_idx)
+    #         # Offset slightly to center in the tile
+    #         draw.text((x + 2, 2), label, fill="red", font=font)
+    #         col_idx += 1
+
+    #     # Draw Row Numbers (Y) on the left
+    #     row_idx = 0
+    #     for y in range(0, height, tile_size):
+    #         # Draw text with a black outline
+    #         label = str(row_idx)
+    #         draw.text((2, y + 2), label, fill="red", font=font)
+    #         row_idx += 1
+
+    #     # 3. Center Marker (Heuristic)
+    #     # In Pokemon, the player is ALMOST ALWAYS at (X=4, Y=4) or (X=5, Y=4)
+    #     # Let's highlight the center tile so the agent knows where IT is.
+    #     center_x = (width // 2) // tile_size * tile_size
+    #     center_y = (height // 2) // tile_size * tile_size
+    #     draw.rectangle([center_x, center_y, center_x + tile_size, center_y + tile_size], outline="yellow", width=2)
+
+    #     return image
     
     def add_to_history(self, role: str, content: Any, has_image: bool = False, tokens: int = 0) -> None:
         """Add a message to both full history and context history."""
@@ -294,6 +345,7 @@ class GameBoyVGAgent(VideoGameBenchAgent):
         self.context_window = context_window
 
         self.action = ""
+        our_prev_action_placeholder = ""  # to keep reader clarity
         self.prev_action = ""
 
         self.image_dir = self.log_dir / "game_screen"
@@ -302,6 +354,13 @@ class GameBoyVGAgent(VideoGameBenchAgent):
         if self.ui:
             self.monitor_dir = self.log_dir / "monitor"
             self.monitor_dir.mkdir(exist_ok=True)
+        
+        # >>> NEW: initialize embedding memory
+        self.embedding_memory = EmbeddingMemory(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
+            max_items=5000,
+            use_faiss=False
+        )
 
         logger.info(f"{self.__class__.__name__} initialized. Logging to: {self.log_dir}")
 
@@ -325,7 +384,16 @@ class GameBoyVGAgent(VideoGameBenchAgent):
                           prev_action: Optional[str] = None) -> None:
         """Store the observation in the history."""
         image = observation['screen']
+        
+        # # --- NEW CONTEXT ENGINEERING: VISUAL GRID ---
+        # # This modifies the image being sent to the LLM (and saved to logs)
+        # # ensuring the agent can "see" the tiles.
+        # image = self._add_visual_grid(image, tile_size=16) 
+        # # ---------------------------------------------
+
         buttons = observation['buttons']
+        # image = observation['screen']
+        # buttons = observation['buttons']
         
         # Save image to log directory
         image_path = self._save_image(image)
@@ -360,9 +428,76 @@ class GameBoyVGAgent(VideoGameBenchAgent):
             ]
         self.add_to_history("user", user_content, has_image=True)
         
+        # >>> NEW: add a compact state snippet to embedding memory
+        state_text = self._compose_state_text()
+        self.embedding_memory.add([state_text], [{"step": self.step_count, "type": "state"}])
+        self.file_logger.info(f"[emb] add step={self.step_count} text='{state_text[:120]}'")
+
+        # <<<
+
+    # >>> NEW: helper to summarize state for embeddings
+    def _compose_state_text(self) -> str:
+        """
+        Build a short text summary of the current game state for embeddings.
+        Uses the latest user-visible texts and last action.
+        """
+        texts: List[str] = []
+        # scan recent messages (reverse order) and collect short text parts
+        for m in reversed(self.context_history):
+            c = m.content
+            if isinstance(c, list):
+                for item in c:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        t = item.get("text", "")
+                        if t:
+                            texts.append(t)
+            elif isinstance(c, str):
+                if c:
+                    texts.append(c)
+            if len(texts) >= 3:
+                break
+        last_obs = " | ".join(texts)[:200]
+        act = self.action or "None"
+        return f"game={self.game}; step={self.step_count}; last_action={act}; obs={last_obs}"
+    # <<<
+
     async def _prepare_messages(self) -> List[Dict[str, str]]:
         """Prepare the message list for LLM generation."""
-        messages = [{"role": m.role, "content": m.content} for m in self.context_history]
+        # messages = [{"role": m.role, "content": m.content} for m in self.context_history]
+        self.file_logger.info(f"[emb] _prepare_messages start step={self.step_count}")
+        messages = [{"role": m.role, "content": m.content} for m in self.context_history[-3:]]
+
+        # >>> NEW: embedding retrieval + loop guard
+        query = self._compose_state_text()
+
+        # Retrieve top similar past situations
+        hits = self.embedding_memory.search(query, k=3)
+        # log retrieval hit count
+        self.file_logger.info(f"[emb] step={self.step_count} hits={len(hits)} query='{query[:120]}'")
+
+        if hits:
+            retrieved = "\n".join([f"- {t}" for (t, _meta, _score) in hits])
+            self.file_logger.info(f"[emb] retrieved:\n{retrieved}")
+            messages.append({
+                "role": "user",
+                "content": (
+                    "[Relevant past situations]:\n"
+                    f"{retrieved}\n"
+                    "Use these to avoid repeating mistakes or getting stuck."
+                )
+            })
+
+        # Semantic loop/stall detection
+        if self.embedding_memory.loop_detect(query, recent=6, thresh=0.985):
+            self.file_logger.info(f"[emb] loop_detected step={self.step_count}")
+            messages.append({
+                "role": "system",
+                "content": (
+                    "You appear to be stuck in a repeating state.\n"
+                    "Do NOT repeat the same action. Try a different strategy or direction."
+                )
+            })
+        # <<<
         messages.append({
             "role": "user",
             "content": f"{REFLECTION_PROMPT}\n\n[Your current reflection memory]:\n{self.reflection_memory}"
@@ -410,6 +545,7 @@ class GameBoyVGAgent(VideoGameBenchAgent):
 
         # Update UI state
         self._update_ui_state("")
+        self.file_logger.info(f"[step] get_action start step={self.step_count}")
         
         # Prepare and send messages to LLM
         messages = await self._prepare_messages()
@@ -418,6 +554,9 @@ class GameBoyVGAgent(VideoGameBenchAgent):
             system_message=self.system_prompt,
             messages=messages
         )
+        
+        self.file_logger.info(f"[step] get_action received LLM response at step={self.step_count}")
+
         response_time = time.time() - start_time
 
         # Handle error response
